@@ -1,26 +1,110 @@
 package raft
 
-import "time"
+import (
+	"fmt"
+	"sort"
+	"time"
+)
 
-// add log entries according to the ApplyMsg struct
 type LogEntry struct {
-	Term         int
-	CommandValid bool
-	Command      interface{}
+	Term         int         // the log entry's term
+	CommandValid bool        // if it should be applied
+	Command      interface{} // the command should be applied to the state machine
 }
 
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
 
+	// used to probe the match point
 	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []LogEntry
+
+	// used to update the follower's commitIndex
+	LeaderCommit int
+}
+
+func (args *AppendEntriesArgs) String() string {
+	return fmt.Sprintf("Leader-%d, T%d, Prev:[%d]T%d, (%d, %d], CommitIdx: %d",
+		args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm,
+		args.PrevLogIndex, args.PrevLogIndex+len(args.Entries), args.LeaderCommit)
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConfilictIndex int
+	ConfilictTerm  int
+}
+
+func (reply *AppendEntriesReply) String() string {
+	return fmt.Sprintf("T%d, Sucess: %v, ConflictTerm: [%d]T%d", reply.Term, reply.Success, reply.ConfilictIndex, reply.ConfilictTerm)
+}
+
+// Peer's callback
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Appended, Args=%v", args.LeaderId, args.String())
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	// align the term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Higher term, T%d<T%d", args.LeaderId, args.Term, rf.currentTerm)
+		return
+	}
+	if args.Term >= rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	defer func() {
+		rf.resetElectionTimerLocked()
+		if !reply.Success {
+			LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower Conflict: [%d]T%d", args.LeaderId, reply.ConfilictIndex, reply.ConfilictTerm)
+			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower Log=%v", args.LeaderId, rf.log.String())
+		}
+	}()
+
+	// return failure if prevLog not matched
+	if args.PrevLogIndex >= rf.log.size() {
+		reply.ConfilictTerm = InvalidTerm
+		reply.ConfilictIndex = rf.log.size()
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log too short, Len:%d < Prev:%d", args.LeaderId, rf.log.size(), args.PrevLogIndex)
+		return
+	}
+	if args.PrevLogIndex < rf.log.snapLastIdx {
+		reply.ConfilictTerm = rf.log.snapLastTerm
+		reply.ConfilictIndex = rf.log.snapLastIdx
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log truncated in %d", args.LeaderId, rf.log.snapLastIdx)
+		return
+	}
+	if rf.log.at(args.PrevLogIndex).Term != args.PrevLogTerm {
+		reply.ConfilictTerm = rf.log.at(args.PrevLogIndex).Term
+		reply.ConfilictIndex = rf.log.firstFor(reply.ConfilictTerm)
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Prev log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log.at(args.PrevLogIndex).Term, args.PrevLogTerm)
+		return
+	}
+
+	// append the leader log entries to local
+	rf.log.appendFrom(args.PrevLogIndex, args.Entries)
+	rf.persistLocked()
+	reply.Success = true
+	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
+
+	// hanle LeaderCommit
+	if args.LeaderCommit > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+		if rf.log.size()-1 < rf.commitIndex {
+			rf.commitIndex = rf.log.size() - 1
+		}
+		rf.applyCond.Signal()
+	}
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -28,18 +112,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// 复制相关
-func (rf *Raft) replicationTicker(term int) {
-	for !rf.killed() {
-		ok := rf.startReplication(term)
-		if !ok {
-			return
-		}
-
-		time.Sleep(replicateInterval)
-	}
+func (rf *Raft) getMajorityIndexLocked() int {
+	tmpIndexes := make([]int, len(rf.peers))
+	copy(tmpIndexes, rf.matchIndex)
+	sort.Ints(sort.IntSlice(tmpIndexes))
+	majorityIdx := (len(rf.peers) - 1) / 2
+	LOG(rf.me, rf.currentTerm, DDebug, "Match index after sort: %v, majority[%d]=%d", tmpIndexes, majorityIdx, tmpIndexes[majorityIdx])
+	return tmpIndexes[majorityIdx]
 }
 
+// only valid in the given `term`
 func (rf *Raft) startReplication(term int) bool {
 	replicateToPeer := func(peer int, args *AppendEntriesArgs) {
 		reply := &AppendEntriesReply{}
@@ -51,99 +133,117 @@ func (rf *Raft) startReplication(term int) bool {
 			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Lost or crashed", peer)
 			return
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Append, Reply=%v", peer, reply.String())
+
 		// align the term
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
 			return
 		}
 
-		if !reply.Success {
-			idx := rf.nextIndex[peer] - 1
-			term := rf.log[idx].Term
-			for idx > 0 && rf.log[idx].Term == term {
-				idx--
-			}
-			rf.nextIndex[peer] = idx + 1
-			LOG(rf.me, rf.currentTerm, DLog, "Log not matched in %d, Update next=%d",
-				args.PrevLogIndex, rf.nextIndex[peer])
+		// check context lost
+		if rf.contextLostLocked(Leader, term) {
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context Lost, T%d:Leader->T%d:%s", peer, term, rf.currentTerm, rf.role)
 			return
 		}
-		// update the match/next index if log appended successfully
-		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+
+		// hanle the reply
+		// probe the lower index if the prevLog not matched
+		if !reply.Success {
+			prevIndex := rf.nextIndex[peer]
+			if reply.ConfilictTerm == InvalidTerm {
+				rf.nextIndex[peer] = reply.ConfilictIndex
+			} else {
+				firstIndex := rf.log.firstFor(reply.ConfilictTerm)
+				if firstIndex != InvalidIndex {
+					rf.nextIndex[peer] = firstIndex
+				} else {
+					rf.nextIndex[peer] = reply.ConfilictIndex
+				}
+			}
+			// avoid unordered reply
+			// avoid the late reply move the nextIndex forward again
+			if rf.nextIndex[peer] > prevIndex {
+				rf.nextIndex[peer] = prevIndex
+			}
+
+			nextPrevIndex := rf.nextIndex[peer] - 1
+			nextPrevTerm := InvalidTerm
+			if nextPrevIndex >= rf.log.snapLastIdx {
+				nextPrevTerm = rf.log.at(nextPrevIndex).Term
+			}
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, Try next Prev=[%d]T%d",
+				peer, args.PrevLogIndex, args.PrevLogTerm, nextPrevIndex, nextPrevTerm)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.log.String())
+			return
+		}
+
+		// update match/next index if log appended successfully
+		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries) // important
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
-		// TODO: need compute the new commitIndex here,
-		// but we leave it to the other chapter
+		// update the commitIndex
+		majorityMatched := rf.getMajorityIndexLocked()
+		if majorityMatched > rf.commitIndex && rf.log.at(majorityMatched).Term == rf.currentTerm {
+			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
+			rf.commitIndex = majorityMatched
+			rf.applyCond.Signal()
+		}
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if rf.contextLostLocked(Leader, term) {
-		LOG(rf.me, rf.currentTerm, DLeader, "Leader[T%d] -> %s[T%d]", term, rf.role, rf.currentTerm)
+		LOG(rf.me, rf.currentTerm, DLog, "Lost Leader[%d] to %s[T%d]", term, rf.role, rf.currentTerm)
 		return false
 	}
 
-	//向其他节点发送
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
-			// Don't forget to update Leader's matchIndex
-			rf.matchIndex[peer] = len(rf.log) - 1
-			rf.nextIndex[peer] = len(rf.log)
+			rf.matchIndex[peer] = rf.log.size() - 1
+			rf.nextIndex[peer] = rf.log.size()
 			continue
 		}
 
 		prevIdx := rf.nextIndex[peer] - 1
-		prevTerm := rf.log[prevIdx].Term
+		if prevIdx < rf.log.snapLastIdx {
+			args := &InstallSnapshotArgs{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.log.snapLastIdx,
+				LastIncludedTerm:  rf.log.snapLastTerm,
+				Snapshot:          rf.log.snapshot,
+			}
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, SendSnap, Args=%v", peer, args.String())
+			go rf.installToPeer(peer, term, args)
+			continue
+		}
 
+		prevTerm := rf.log.at(prevIdx).Term
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevIdx,
 			PrevLogTerm:  prevTerm,
-			Entries:      append([]LogEntry(nil), rf.log[prevIdx+1:]...),
+			Entries:      append([]LogEntry(nil), rf.log.tail(prevIdx+1)...),
 			LeaderCommit: rf.commitIndex,
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Append, Args=%v", peer, args.String())
 		go replicateToPeer(peer, args)
 	}
+
 	return true
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+// could only replcate in the given term
+func (rf *Raft) replicationTicker(term int) {
+	for !rf.killed() {
+		ok := rf.startReplication(term)
+		if !ok {
+			break
+		}
 
-	// For debug
-	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Receive log, Prev=[%d]T%d, Len()=%d",
-		args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries))
-
-	reply.Term = rf.currentTerm
-	reply.Success = false
-	// align the term
-	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log", args.LeaderId)
-		return
+		time.Sleep(replicateInterval)
 	}
-	if args.Term >= rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term)
-	}
-
-	// return failure if the previous log not matched
-	if args.PrevLogIndex >= len(rf.log) {
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject Log, Follower log too short, Len:%d <= Prev:%d",
-			args.LeaderId, len(rf.log), args.PrevLogIndex)
-		return
-	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject Log, Prev log not match, [%d]: T%d != T%d",
-			args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
-		return
-	}
-
-	// append the leader logs to local
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	LOG(rf.me, rf.currentTerm, DLog2, "Follower append logs: (%d, %d]",
-		args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
-	reply.Success = true
-	// reset the timer
-	rf.resetElectionTimerLocked()
-	reply.Success = true
 }

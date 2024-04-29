@@ -28,6 +28,26 @@ import (
 	"course/labrpc"
 )
 
+const (
+	electionTimeoutMin time.Duration = 250 * time.Millisecond
+	electionTimeoutMax time.Duration = 400 * time.Millisecond
+
+	replicateInterval time.Duration = 70 * time.Millisecond
+)
+
+const (
+	InvalidTerm  int = 0
+	InvalidIndex int = 0
+)
+
+type Role string
+
+const (
+	Follower  Role = "Follower"
+	Candidate Role = "Candidate"
+	Leader    Role = "Leader"
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -37,19 +57,6 @@ import (
 // in part PartD you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-type Role string
-
-const (
-	Follower  Role = "Follower"
-	Candidate Role = "Candidate"
-	Leader    Role = "Leader"
-)
-const (
-	electionTimeoutMin time.Duration = 250 * time.Millisecond
-	electionTimeoutMax time.Duration = 400 * time.Millisecond
-	replicateInterval  time.Duration = 200 * time.Millisecond
-)
-
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -75,42 +82,57 @@ type Raft struct {
 	// state a Raft server must maintain.
 	role        Role
 	currentTerm int
-	votedFor    int //-1 means vote for none
+	votedFor    int // -1 means vote for none
 
-	electionStart   time.Time
-	electionTimeout time.Duration //random// log in Peer's local
+	// log in the Peer's local
+	log *RaftLog
 
-	log []LogEntry
-
-	// only used when it is Leader,
-	// log view for each peer
+	// only used in Leader
+	// every peer's view
 	nextIndex  []int
 	matchIndex []int
+
+	// fields for apply loop
+	commitIndex int
+	lastApplied int
+	applyCh     chan ApplyMsg
+	snapPending bool
+	applyCond   *sync.Cond
+
+	electionStart   time.Time
+	electionTimeout time.Duration // random
 }
 
 func (rf *Raft) becomeFollowerLocked(term int) {
 	if term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DError, "Can't be Follower, lowerterm:T%d", term)
+		LOG(rf.me, rf.currentTerm, DError, "Can't become Follower, lower term: T%d", term)
 		return
 	}
-	LOG(rf.me, rf.currentTerm, DLog, "%s->Follower, For T%s->T%s", rf.role, rf.currentTerm, term)
+
+	LOG(rf.me, rf.currentTerm, DLog, "%s->Follower, For T%v->T%v", rf.role, rf.currentTerm, term)
 	rf.role = Follower
+	shouldPersit := rf.currentTerm != term
 	if term > rf.currentTerm {
 		rf.votedFor = -1
 	}
 	rf.currentTerm = term
+	if shouldPersit {
+		rf.persistLocked()
+	}
 }
 
 func (rf *Raft) becomeCandidateLocked() {
 	if rf.role == Leader {
-		LOG(rf.me, rf.currentTerm, DVote, "Leader can't become Candidate")
+		LOG(rf.me, rf.currentTerm, DError, "Leader can't become Candidate")
 		return
 	}
-	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T %d", rf.role, rf.currentTerm+1) // +1???
+
+	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T%d", rf.role, rf.currentTerm+1)
+	rf.resetElectionTimerLocked()
 	rf.currentTerm++
 	rf.role = Candidate
 	rf.votedFor = rf.me
-	rf.resetElectionTimerLocked()
+	rf.persistLocked()
 }
 
 func (rf *Raft) becomeLeaderLocked() {
@@ -118,10 +140,11 @@ func (rf *Raft) becomeLeaderLocked() {
 		LOG(rf.me, rf.currentTerm, DError, "Only Candidate can become Leader")
 		return
 	}
-	LOG(rf.me, rf.currentTerm, DLeader, "%s->Leader in T%d", rf.currentTerm)
+
+	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
 	for peer := 0; peer < len(rf.peers); peer++ {
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 		rf.matchIndex[peer] = 0
 	}
 }
@@ -134,103 +157,6 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.role == Leader
 }
-
-func (rf *Raft) contextLostLocked(role Role, term int) bool {
-	return !(rf.currentTerm == term && rf.role == role)
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
-	// Your code here (PartC).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
-}
-
-// restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (PartC).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (PartD).
-
-}
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-
-// type AppendEntriesArgs struct {
-// 	Term     int
-// 	LeaderId int
-// }
-
-// type AppendEntriesReply struct {
-// 	Term    int
-// 	Success bool
-// }
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-
-// func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-// 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-// 	return ok
-// }
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -245,13 +171,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (PartB).
+	if rf.role != Leader {
+		return 0, 0, false
+	}
+	rf.log.append(LogEntry{
+		CommandValid: true,
+		Command:      command,
+		Term:         rf.currentTerm,
+	})
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", rf.log.size()-1, rf.currentTerm)
+	rf.persistLocked()
 
-	return index, term, isLeader
+	return rf.log.size() - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -273,6 +207,10 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) contextLostLocked(role Role, term int) bool {
+	return !(rf.currentTerm == term && rf.role == role)
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -291,17 +229,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (PartA, PartB, PartC).
 	rf.role = Follower
-	rf.currentTerm = 0
+	rf.currentTerm = 1
 	rf.votedFor = -1
-	rf.log = append(rf.log, LogEntry{})
 
-	rf.matchIndex = make([]int, len(rf.peers))
+	// a dummy entry to aovid lots of corner checks
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
+
+	// initialize the leader's view slice
 	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	// initialize the fields used for apply
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.snapPending = false
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
+	go rf.applicationTicker()
 
 	return rf
 }
